@@ -1,16 +1,16 @@
 /**
- * Audio Guestbook, Copyright (c) 2022 Playful Technology
- * 
- * Tested using a Teensy 4.0 with Teensy Audio Shield, although should work 
- * with minor modifications on other similar hardware
- * 
- * When handset is lifted, a pre-recorded greeting message is played, followed by a tone.
- * Then, recording starts, and continues until the handset is replaced.
- * Playback button allows all messages currently saved on SD card through earpiece 
- * 
- * Files are saved on SD card as 44.1kHz, 16-bit, mono signed integer RAW audio format
- * These can be loaded directly into Audacity (https://www.audacityteam.org/). Or else, converted to WAV/MP3 format using SOX (https://sourceforge.net/projects/sox/)
- * 
+   Audio Guestbook, Copyright (c) 2022 Playful Technology
+
+   Tested using a Teensy 4.0 with Teensy Audio Shield, although should work
+   with minor modifications on other similar hardware
+
+   When handset is lifted, a pre-recorded greeting message is played, followed by a tone.
+   Then, recording starts, and continues until the handset is replaced.
+   Playback button allows all messages currently saved on SD card through earpiece
+
+   Files are saved on SD card as 44.1kHz, 16-bit, mono signed integer RAW audio format
+   These can be loaded directly into Audacity (https://www.audacityteam.org/). Or else, converted to WAV/MP3 format using SOX (https://sourceforge.net/projects/sox/)
+
  **/
 
 // INCLUDES
@@ -35,6 +35,7 @@
 // And those used for inputs
 #define HOOK_PIN 0
 #define PLAYBACK_BUTTON_PIN 1
+#define HOOK_PIN_DEFAULT_STATE 22
 
 // GLOBALS
 // Audio initialisation code can be generated using the GUI interface at https://www.pjrc.com/teensy/gui/
@@ -48,8 +49,8 @@ AudioRecordQueue         queue1; // Creating an audio buffer in memory before sa
 AudioMixer4              mixer; // Allows merging several inputs to same output
 AudioOutputI2S           i2s1; // I2S interface to Speaker/Line Out on Audio shield
 // Connections
-AudioConnection patchCord1(waveform1, 0, mixer, 0); // wave to mixer 
-AudioConnection patchCord2(playRaw1, 0, mixer, 1); // raw audio to mixer
+AudioConnection patchCord1(waveform1, 0, mixer, 0); // wave to mixer
+//AudioConnection patchCord2(playRaw1, 0, mixer, 1); // raw audio to mixer
 AudioConnection patchCord3(playWav1, 0, mixer, 2); // wav file playback mixer
 AudioConnection patchCord4(mixer, 0, i2s1, 0); // mixer output to speaker (L)
 AudioConnection patchCord5(i2s2, 0, queue1, 0); // mic input to queue (L)
@@ -62,24 +63,28 @@ File frec;
 
 // Use long 40ms debounce time on hook switch
 Bounce buttonRecord = Bounce(HOOK_PIN, 40);
-Bounce buttonPlay = Bounce(PLAYBACK_BUTTON_PIN, 8);
+Bounce buttonPlay = Bounce(PLAYBACK_BUTTON_PIN, 40);
+Bounce buttonZwora = Bounce(HOOK_PIN_DEFAULT_STATE, 8);
 
 // Keep track of current state of the device
 enum Mode {Initialising, Ready, Prompting, Recording, Playing};
 Mode mode = Mode::Initialising;
 
+bool HookPinLiftedHigh = false;
+
 void setup() {
 
-  // Note that Serial.begin() is not required for Teensy - 
+  // Note that Serial.begin() is not required for Teensy -
   // by default it initialises serial communication at full USB speed
   // See https://www.pjrc.com/teensy/td_serial.html
   // Serial.begin()
   Serial.println(__FILE__ __DATE__);
-  
+
   // Configure the input pins
   pinMode(HOOK_PIN, INPUT_PULLUP);
   pinMode(PLAYBACK_BUTTON_PIN, INPUT_PULLUP);
-
+  pinMode(HOOK_PIN_DEFAULT_STATE, INPUT_PULLUP);
+  
   // Audio connections require memory, and the record queue
   // uses this memory to buffer incoming audio.
   AudioMemory(60);
@@ -89,14 +94,16 @@ void setup() {
   // Define which input on the audio shield to use (AUDIO_INPUT_LINEIN / AUDIO_INPUT_MIC)
   sgtl5000_1.inputSelect(AUDIO_INPUT_MIC);
   sgtl5000_1.volume(0.5);
+  //sgtl5000_1.dacVolume(0.5);    // set the "dac" volume (extra control)
 
   // Play a beep to indicate system is online
   waveform1.begin(WAVEFORM_SINE);
+  waveform1.amplitude(1.0);
   waveform1.frequency(440);
-  waveform1.amplitude(0.9);
-  wait(250);
-  waveform1.amplitude(0);
-  delay(1000);
+
+  delay(250);
+  waveform1.amplitude(0.0);
+  delay(1750);
 
   // Initialize the SD card
   SPI.setMOSI(SDCARD_MOSI_PIN);
@@ -115,12 +122,23 @@ void setup() {
   // Synchronise the Time object used in the program code with the RTC time provider.
   // See https://github.com/PaulStoffregen/Time
   setSyncProvider(getTeensy3Time);
-  
+
   // Define a callback that will assign the correct datetime for any file system operations
   // (i.e. saving a new audio recording onto the SD card)
   FsDateTime::setCallback(dateTime);
 
   mode = Mode::Ready;
+
+  //buttonZwora.update();
+
+  HookPinLiftedHigh = false;
+
+
+  if (buttonZwora.risingEdge())
+  {
+    Serial.println("Jumper taken off");
+    HookPinLiftedHigh = false;
+  }
 }
 
 void loop() {
@@ -128,33 +146,44 @@ void loop() {
   buttonRecord.update();
   buttonPlay.update();
 
-  switch(mode){
+  if (buttonRecord.fallingEdge()) Serial.println("Button (pin 0) Press");
+  if (buttonPlay.fallingEdge()) Serial.println("Button (pin 1) Press");
+  if (buttonRecord.risingEdge()) Serial.println("Button (pin 0) Release");
+  if (buttonPlay.risingEdge()) Serial.println("Button (pin 1) Release");
+
+  switch (mode) {
     case Mode::Ready:
       // Rising edge occurs when the handset is lifted
-      if (buttonRecord.risingEdge()) {
+      if ((buttonRecord.risingEdge() && HookPinLiftedHigh == false) || (buttonRecord.fallingEdge() && HookPinLiftedHigh == true)) {
         Serial.println("Handset lifted");
         mode = Mode::Prompting;
       }
-      else if(buttonPlay.fallingEdge()) {
+      else if (buttonPlay.fallingEdge()) {
         playAllRecordings();
       }
       break;
 
     case Mode::Prompting:
+      Serial.println("Prompting");
       // Wait a second for users to put the handset to their ear
       wait(1000);
       // Play the greeting inviting them to record their message
-      playWav1.play("greeting.wav");    
+      playWav1.play("greeting.wav");
+      wait(100);
       // Wait until the  message has finished playing
       while (playWav1.isPlaying()) {
+        //Serial.println("In the loop");
+        wait(100);
         // Check whether the handset is replaced
+
         buttonRecord.update();
-        // Handset is replaced
-        if(buttonRecord.fallingEdge()) {
+        if ((buttonRecord.fallingEdge() && HookPinLiftedHigh == false) || (buttonRecord.risingEdge() && HookPinLiftedHigh == true)) {
+          Serial.println("Handset is replaced");
           playWav1.stop();
           mode = Mode::Ready;
           return;
         }
+
       }
       // Debug message
       Serial.println("Starting Recording");
@@ -169,7 +198,7 @@ void loop() {
 
     case Mode::Recording:
       // Handset is replaced
-      if(buttonRecord.fallingEdge()){
+      if ((buttonRecord.fallingEdge() && HookPinLiftedHigh == false) || (buttonRecord.risingEdge() && HookPinLiftedHigh == true)) {
         // Debug log
         Serial.println("Stopping Recording");
         // Stop recording
@@ -183,20 +212,22 @@ void loop() {
         waveform1.amplitude(0.9);
         wait(50);
         waveform1.amplitude(0);
+        Serial.println("Stopped Recording");
       }
       else {
         continueRecording();
+        //Serial.println("Continuing recoding");
       }
       break;
 
     case Mode::Playing:
-      break;  
-  }   
+      break;
+  }
 }
 
 void startRecording() {
   // Find the first available file number
-  for (uint8_t i=0; i<9999; i++) {
+  for (uint8_t i = 0; i < 9999; i++) {
     // Format the counter as a five-digit number with leading zeroes, followed by file extension
     snprintf(filename, 11, " %05d.RAW", i);
     // Create if does not exist, do not open existing, write, sync after write
@@ -205,7 +236,7 @@ void startRecording() {
     }
   }
   frec = SD.open(filename, FILE_WRITE);
-  if(frec) {
+  if (frec) {
     Serial.print("Recording to ");
     Serial.println(filename);
     queue1.begin();
@@ -226,7 +257,7 @@ void continueRecording() {
     // writes are used.
     memcpy(buffer, queue1.readBuffer(), 256);
     queue1.freeBuffer();
-    memcpy(buffer+256, queue1.readBuffer(), 256);
+    memcpy(buffer + 256, queue1.readBuffer(), 256);
     queue1.freeBuffer();
     // Write all 512 bytes to the SD card
     frec.write(buffer, 512);
@@ -248,10 +279,11 @@ void stopRecording() {
 }
 
 
+
 void playAllRecordings() {
   // Recording files are saved in the root directory
   File dir = SD.open("/");
-  
+
   while (true) {
     File entry =  dir.openNextFile();
     if (!entry) {
@@ -275,6 +307,7 @@ void playAllRecordings() {
     entry.close();
 
     while (playRaw1.isPlaying()) {
+      wait(100);
       buttonPlay.update();
       buttonRecord.update();
       // Button is pressed again
@@ -313,11 +346,11 @@ void wait(unsigned int milliseconds) {
   elapsedMillis msec=0;
 
   while (msec <= milliseconds) {
-    buttonRecord.update();
+    //buttonRecord.update();
     buttonPlay.update();
-    if (buttonRecord.fallingEdge()) Serial.println("Button (pin 0) Press");
-    if (buttonPlay.fallingEdge()) Serial.println("Button (pin 1) Press");
-    if (buttonRecord.risingEdge()) Serial.println("Button (pin 0) Release");
-    if (buttonPlay.risingEdge()) Serial.println("Button (pin 1) Release");
+    //if (buttonRecord.fallingEdge()) Serial.println("Button (pin 0) Press");
+    //if (buttonPlay.fallingEdge()) Serial.println("Button (pin 1) Press");
+    //if (buttonRecord.risingEdge()) Serial.println("Button (pin 0) Release");
+    //if (buttonPlay.risingEdge()) Serial.println("Button (pin 1) Release");
   }
 }
